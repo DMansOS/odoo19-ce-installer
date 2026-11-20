@@ -5,10 +5,20 @@
 # Ubuntu Server 24.04 LTS + PostgreSQL + NGINX + SSL
 # SIE7E Consultech - www.sieteconsultech.com
 # ============================================================
-# Uso:
-#   1. Edita la sección "CONFIGURACIÓN PERSONALIZABLE".
-#   2. Si el archivo viene de Windows: sed -i 's/\r$//' odoo19CE_install_v2.sh
-#   3. sudo bash odoo19CE_install_v2.sh
+# Uso (como root, en el servidor del cliente):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/DMansOS/odoo19-ce-installer/main/odoo19CE_install_v2.sh)
+#
+# El script pregunta los datos (dominio, correo, proyecto...), muestra un
+# resumen y pide confirmación antes de instalar.
+# NO usar "curl ... | bash": así las preguntas no pueden leer lo que escribes.
+#
+# Sin preguntas: pasa los datos como variables de entorno, por ejemplo
+#   DOMAIN=cliente.com EMAIL=ventas@cliente.com ODOO_SI=1 bash odoo19CE_install_v2.sh
+# Variables: DOMAIN, USE_WWW, EMAIL, ODOO_PROJECT, ODOO_USER, HTTP_PORT,
+#            GEVENT_PORT, ADMIN_PASSWORD, ODOO_SI, ODOO_SOLO_PREGUNTAS.
+# ODOO_SOLO_PREGUNTAS=1 muestra el resumen y sale sin instalar nada.
+#
+# Si el archivo viene de Windows: sed -i 's/\r$//' odoo19CE_install_v2.sh
 # ============================================================
 
 set -euo pipefail
@@ -17,26 +27,20 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
 # ============================================================
-# === CONFIGURACIÓN PERSONALIZABLE ===
+# === DATOS DE LA INSTALACIÓN ===
+# Se piden al arrancar. Si la variable ya viene en el entorno, no se pregunta.
 # ============================================================
 
 ODOO_VERSION="19.0"
 
-ODOO_PROJECT="odoo_cliente***"     # Cambia esto >>> Carpeta de instalación: /opt/<proyecto> (sin espacios ni símbolos)
-ODOO_USER="odoo19"                 # Cambia esto >>> Usuario del sistema y nombre del servicio (uno distinto por instancia)
-
-ADMIN_PASSWORD=""                  # Contraseña maestra. Vacía = se genera una segura y se guarda en /root
-
-DOMAIN="dominio.com"               # Cambia esto >>> Debe apuntar a este servidor
-USE_WWW="true"                     # "true" si www.dominio.com también apunta al servidor; si no, "false"
-EMAIL="admin@dominio.com"          # Cambia esto >>> Correo para avisos de Let's Encrypt
-
-# ============================================================
-# === PUERTOS (cambiar solo para varias instancias en el mismo servidor) ===
-# ============================================================
-
-HTTP_PORT=8069                     # Puerto principal de Odoo
-GEVENT_PORT=8072                   # Puerto WebSocket (chat y notificaciones en vivo)
+ODOO_PROJECT="${ODOO_PROJECT:-}"      # Carpeta /opt/<proyecto>. Propuesto: odoo_<cliente>
+ODOO_USER="${ODOO_USER:-}"            # Usuario del sistema y servicio. Propuesto: odoo19
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"  # Contraseña maestra. Vacía = se genera una segura y se guarda en /root
+DOMAIN="${DOMAIN:-}"                  # Debe apuntar a este servidor. Sin valor propuesto
+USE_WWW="${USE_WWW:-}"                # true/false: si www.<dominio> también apunta al servidor. Propuesto: true
+EMAIL="${EMAIL:-}"                    # Avisos de Let's Encrypt. Propuesto: admin@<dominio>
+HTTP_PORT="${HTTP_PORT:-}"            # Puerto principal. Propuesto: 8069 (o el siguiente libre)
+GEVENT_PORT="${GEVENT_PORT:-}"        # Puerto WebSocket. Propuesto: 8072 (o el siguiente libre)
 
 # ============================================================
 # === RENDIMIENTO (ajustar según CPU y RAM del servidor) ===
@@ -50,38 +54,6 @@ LIMIT_TIME_REAL=1200
 MAX_CRON_THREADS=1
 
 # ============================================================
-# === CONFIGURACIÓN INTERNA ===
-# ============================================================
-
-ODOO_HOME="/opt/$ODOO_PROJECT"
-ODOO_DIR="$ODOO_HOME/odoo"
-ODOO_VENV="$ODOO_HOME/odoo-venv"
-CUSTOM_ADDONS="$ODOO_HOME/odoo-custom-addons"
-ODOO_DB_USER="$ODOO_USER"
-
-ODOO_CONF="/etc/$ODOO_USER.conf"
-ODOO_SERVICE="/etc/systemd/system/$ODOO_USER.service"
-
-NGINX_CONF="/etc/nginx/sites-available/$ODOO_USER"
-NGINX_LINK="/etc/nginx/sites-enabled/$ODOO_USER"
-
-WKHTMLTOX_VERSION="0.12.6.1-3"
-WKHTMLTOX_FILE="wkhtmltox_${WKHTMLTOX_VERSION}.jammy_amd64.deb"
-WKHTMLTOX_URL="https://github.com/wkhtmltopdf/packaging/releases/download/${WKHTMLTOX_VERSION}/${WKHTMLTOX_FILE}"
-WKHTMLTOX_DEB="/tmp/${WKHTMLTOX_FILE}"
-
-CREDENTIALS_FILE="/root/${ODOO_PROJECT}_credenciales.txt"
-ACME_ROOT="/var/lib/letsencrypt"
-
-if [ "$USE_WWW" = "true" ]; then
-    SERVER_NAMES="$DOMAIN www.$DOMAIN"
-    CERTBOT_DOMAINS=(-d "$DOMAIN" -d "www.$DOMAIN")
-else
-    SERVER_NAMES="$DOMAIN"
-    CERTBOT_DOMAINS=(-d "$DOMAIN")
-fi
-
-# ============================================================
 # === FUNCIONES ===
 # ============================================================
 
@@ -93,7 +65,7 @@ titulo() {
 }
 
 error() {
-    echo -e "\e[1;31mERROR:\e[0m $1"
+    echo -e "\e[1;31mERROR:\e[0m $1" >&2
     exit 1
 }
 
@@ -134,6 +106,210 @@ EOF
 }
 
 # ============================================================
+# === PREGUNTAS: funciones ===
+# ============================================================
+
+# Las respuestas se leen siempre de la terminal (/dev/tty), nunca de stdin:
+# así funcionan también cuando el script llega por curl. ODOO_ENTRADA cambia
+# el origen (solo para pruebas).
+ENTRADA="${ODOO_ENTRADA:-/dev/tty}"
+HAY_TERMINAL="no"
+
+abrir_entrada() {
+    # Se abre una sola vez como descriptor 3. Se prueba antes en un subshell
+    # porque un exec fallido cerraría el script.
+    if ( exec 3<"$ENTRADA" ) 2>/dev/null; then
+        exec 3<"$ENTRADA"
+        HAY_TERMINAL="si"
+    fi
+}
+
+leer_linea() {
+    # Uso: leer_linea variable [-s]
+    # Devuelve 1 si no hay terminal o si se acabó la entrada (y ya no vuelve a leer).
+    local -n _destino="$1"
+    local opcion="${2:-}"
+    [ "$HAY_TERMINAL" = "si" ] || return 1
+    if ! IFS= read -r ${opcion:+"$opcion"} -u 3 _destino; then
+        HAY_TERMINAL="no"
+        return 1
+    fi
+}
+
+limpia_dominio() {
+    local d="${1,,}"
+    d="${d// /}"
+    d="${d#http://}"
+    d="${d#https://}"
+    d="${d%%/*}"
+    d="${d#www.}"
+    echo "$d"
+}
+
+nombre_corto() {
+    # Primera parte del dominio, apta para nombres de proyecto y usuario.
+    local d="${1%%.*}"
+    echo "${d//-/_}"
+}
+
+# Los validadores devuelven 0 si el valor sirve; si no, 1 y el motivo por stderr.
+
+valida_proyecto() {
+    if [[ ! "$1" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "Usa solo letras, números, guion y guion bajo (ej.: odoo_sdluxes)." >&2
+        return 1
+    fi
+}
+
+valida_usuario() {
+    if [[ ! "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] || [ "${#1}" -gt 32 ]; then
+        echo "Usa minúsculas, números, guion y guion bajo (máximo 32), sin empezar por número." >&2
+        return 1
+    fi
+}
+
+valida_dominio() {
+    local re='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    if [[ ! "$1" =~ $re ]] || [ "$1" = "dominio.com" ]; then
+        echo "Escribe un dominio válido, por ejemplo: cliente.com" >&2
+        return 1
+    fi
+}
+
+valida_correo() {
+    local re='^[^@ ]+@[^@ ]+\.[^@ ]+$'
+    if [[ ! "$1" =~ $re ]] || [ "$1" = "admin@dominio.com" ]; then
+        echo "Escribe un correo válido, por ejemplo: ventas@cliente.com" >&2
+        return 1
+    fi
+}
+
+puerto_ocupado() {
+    ss -lnt 2>/dev/null | awk -v p="$1" 'NR > 1 { n = split($4, a, ":"); if (a[n] == p) f = 1 } END { exit !f }'
+}
+
+valida_puerto() {
+    if [[ ! "$1" =~ ^[0-9]+$ ]] || [ "$1" -lt 1024 ] || [ "$1" -gt 65535 ]; then
+        echo "Debe ser un número entre 1024 y 65535." >&2
+        return 1
+    fi
+    if puerto_ocupado "$1"; then
+        echo "El puerto $1 ya está en uso en este servidor." >&2
+        return 1
+    fi
+}
+
+preguntar() {
+    # Uso: preguntar VARIABLE "Texto" "valor_propuesto" validador [limpiador]
+    # Si la variable ya tiene valor, solo se valida. Sin terminal se usa el
+    # valor propuesto; si no hay propuesto o no es válido, error.
+    local var="$1" texto="$2" defecto="$3" validador="$4" limpiador="${5:-}"
+    local valor="${!1:-}" motivo
+    if [ -n "$valor" ]; then
+        if [ -n "$limpiador" ]; then valor="$("$limpiador" "$valor")"; fi
+        motivo="$("$validador" "$valor" 2>&1)" || error "$var: $motivo"
+        printf -v "$var" '%s' "$valor"
+        return 0
+    fi
+    while true; do
+        printf '%s%s: ' "$texto" "${defecto:+ [$defecto]}" >&2
+        if leer_linea valor; then
+            valor="${valor:-$defecto}"
+        else
+            echo >&2
+            valor="$defecto"
+            [ -n "$valor" ] || error "Falta $var y no hay terminal para preguntarlo. Pásalo así: $var=valor"
+        fi
+        if [ -n "$limpiador" ]; then valor="$("$limpiador" "$valor")"; fi
+        if motivo="$("$validador" "$valor" 2>&1)"; then
+            break
+        fi
+        [ "$HAY_TERMINAL" = "si" ] || error "$var: $motivo"
+        echo "  $motivo" >&2
+    done
+    printf -v "$var" '%s' "$valor"
+}
+
+preguntar_si_no() {
+    # Uso: preguntar_si_no VARIABLE "Texto" "s|n"  -> deja true o false
+    local var="$1" texto="$2" defecto="$3" valor="${!1:-}" sufijo respuesta
+    if [ -n "$valor" ]; then
+        case "${valor,,}" in
+            true|s|si|sí|y|yes) valor="true" ;;
+            false|n|no) valor="false" ;;
+            *) error "$var debe ser true o false." ;;
+        esac
+    else
+        if [ "$defecto" = "s" ]; then sufijo="S/n"; else sufijo="s/N"; fi
+        while true; do
+            printf '%s (%s): ' "$texto" "$sufijo" >&2
+            respuesta=""
+            leer_linea respuesta || echo >&2
+            respuesta="${respuesta:-$defecto}"
+            case "${respuesta,,}" in
+                s|si|sí|y|yes) valor="true"; break ;;
+                n|no) valor="false"; break ;;
+            esac
+            echo "  Responde s o n." >&2
+        done
+    fi
+    printf -v "$var" '%s' "$valor"
+}
+
+genera_clave() {
+    ADMIN_PASSWORD="$(openssl rand -base64 36 | tr -d '/+=' | cut -c1-24)"
+    PASSWORD_GENERADA="sí"
+}
+
+clave_debil() {
+    [ "$1" = "admin123" ] || [ "$1" = "admin" ]
+}
+
+preguntar_clave() {
+    # Deja ADMIN_PASSWORD y PASSWORD_GENERADA. Enter vacío o sin terminal = generar.
+    local a b
+    if [ -n "$ADMIN_PASSWORD" ]; then
+        if clave_debil "$ADMIN_PASSWORD"; then
+            error "ADMIN_PASSWORD es insegura. Déjala vacía para generar una automáticamente."
+        fi
+        PASSWORD_GENERADA="no"
+        return 0
+    fi
+    while true; do
+        a=""
+        b=""
+        printf 'Contraseña maestra (no se ve al escribir; Enter = generar una segura): ' >&2
+        leer_linea a -s || true
+        echo >&2
+        if [ -z "$a" ]; then
+            genera_clave
+            return 0
+        fi
+        if clave_debil "$a"; then
+            echo "  Esa contraseña es insegura. Prueba otra o deja vacío para generar una." >&2
+            continue
+        fi
+        printf 'Repite la contraseña: ' >&2
+        leer_linea b -s || true
+        echo >&2
+        if [ "$a" != "$b" ]; then
+            echo "  No coinciden. Intenta de nuevo." >&2
+            continue
+        fi
+        ADMIN_PASSWORD="$a"
+        PASSWORD_GENERADA="no"
+        return 0
+    done
+}
+
+abrir_entrada
+
+# Las pruebas cargan solo las funciones de arriba.
+if [ "${ODOO_SOLO_FUNCIONES:-}" = "1" ]; then
+    return 0
+fi
+
+# ============================================================
 # === VALIDACIONES INICIALES ===
 # ============================================================
 
@@ -147,30 +323,74 @@ fi
 
 [ "$ODOO_VERSION" = "19.0" ] || error "Este script está preparado para Odoo 19.0."
 
-if [[ ! "$ODOO_PROJECT" =~ ^[a-zA-Z0-9_-]+$ ]] || [ "$ODOO_PROJECT" = "odoo_cliente" ]; then
-    error "Configura ODOO_PROJECT (solo letras, números, guion y guion bajo). Ej.: odoo_sdluxes"
+# ============================================================
+# === PREGUNTAS ===
+# ============================================================
+
+titulo "     DATOS DE LA INSTALACIÓN"
+echo "Enter acepta el valor propuesto entre [corchetes]."
+echo
+
+preguntar DOMAIN "Dominio (debe apuntar a este servidor)" "" valida_dominio limpia_dominio
+preguntar_si_no USE_WWW "¿www.$DOMAIN también apunta a este servidor?" "s"
+preguntar EMAIL "Correo para avisos de Let's Encrypt" "admin@$DOMAIN" valida_correo
+
+NOMBRE_CORTO="$(nombre_corto "$DOMAIN")"
+preguntar ODOO_PROJECT "Nombre del proyecto (carpeta /opt/<proyecto>)" "odoo_$NOMBRE_CORTO" valida_proyecto
+
+# Si ya hay un Odoo en este servidor, se propone una instancia aparte.
+USUARIO_PROPUESTO="odoo19"
+if id -u odoo19 >/dev/null 2>&1; then
+    USUARIO_PROPUESTO="odoo19_$NOMBRE_CORTO"
 fi
+preguntar ODOO_USER "Usuario del sistema y servicio" "$USUARIO_PROPUESTO" valida_usuario
 
-[[ "$ODOO_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || error "ODOO_USER no es un nombre de usuario válido."
+PUERTO_PROPUESTO=8069
+while puerto_ocupado "$PUERTO_PROPUESTO" || puerto_ocupado "$((PUERTO_PROPUESTO + 3))"; do
+    PUERTO_PROPUESTO=$((PUERTO_PROPUESTO + 100))
+done
+preguntar HTTP_PORT "Puerto de Odoo" "$PUERTO_PROPUESTO" valida_puerto
+preguntar GEVENT_PORT "Puerto WebSocket (chat y notificaciones)" "$((PUERTO_PROPUESTO + 3))" valida_puerto
+[ "$HTTP_PORT" != "$GEVENT_PORT" ] || error "Los puertos de Odoo y WebSocket deben ser distintos."
 
-if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "dominio.com" ]; then
-    error "Configura DOMAIN antes de ejecutar el script."
-fi
+preguntar_clave
 
-if [ -z "$EMAIL" ] || [ "$EMAIL" = "admin@dominio.com" ]; then
-    error "Configura EMAIL antes de ejecutar el script."
-fi
+# ============================================================
+# === CONFIGURACIÓN INTERNA ===
+# ============================================================
 
-if [ "$ADMIN_PASSWORD" = "admin123" ] || [ "$ADMIN_PASSWORD" = "admin" ]; then
-    error "ADMIN_PASSWORD es insegura. Déjala vacía para generar una automáticamente."
-fi
+ODOO_HOME="/opt/$ODOO_PROJECT"
+ODOO_DIR="$ODOO_HOME/odoo"
+ODOO_VENV="$ODOO_HOME/odoo-venv"
+CUSTOM_ADDONS="$ODOO_HOME/odoo-custom-addons"
+ODOO_DB_USER="$ODOO_USER"
 
-if [ -z "$ADMIN_PASSWORD" ]; then
-    ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)"
-    PASSWORD_GENERADA="sí"
+ODOO_CONF="/etc/$ODOO_USER.conf"
+ODOO_SERVICE="/etc/systemd/system/$ODOO_USER.service"
+
+NGINX_CONF="/etc/nginx/sites-available/$ODOO_USER"
+NGINX_LINK="/etc/nginx/sites-enabled/$ODOO_USER"
+
+WKHTMLTOX_VERSION="0.12.6.1-3"
+WKHTMLTOX_FILE="wkhtmltox_${WKHTMLTOX_VERSION}.jammy_amd64.deb"
+WKHTMLTOX_URL="https://github.com/wkhtmltopdf/packaging/releases/download/${WKHTMLTOX_VERSION}/${WKHTMLTOX_FILE}"
+WKHTMLTOX_DEB="/tmp/${WKHTMLTOX_FILE}"
+
+CREDENTIALS_FILE="/root/${ODOO_PROJECT}_credenciales.txt"
+ACME_ROOT="/var/lib/letsencrypt"
+
+if [ "$USE_WWW" = "true" ]; then
+    SERVER_NAMES="$DOMAIN www.$DOMAIN"
+    CERTBOT_DOMAINS=(-d "$DOMAIN" -d "www.$DOMAIN")
 else
-    PASSWORD_GENERADA="no"
+    SERVER_NAMES="$DOMAIN"
+    CERTBOT_DOMAINS=(-d "$DOMAIN")
 fi
+
+
+# ============================================================
+# === RESUMEN Y CONFIRMACIÓN ===
+# ============================================================
 
 titulo "     INSTALACIÓN AUTOMÁTICA DE ODOO $ODOO_VERSION COMMUNITY"
 echo
@@ -181,9 +401,33 @@ echo "Puerto Odoo        : $HTTP_PORT"
 echo "Puerto WebSocket   : $GEVENT_PORT"
 echo "Dominio(s)         : $SERVER_NAMES"
 echo "Correo             : $EMAIL"
+if [ "$PASSWORD_GENERADA" = "sí" ]; then
+    echo "Contraseña maestra : se generará y se guardará en $CREDENTIALS_FILE"
+else
+    echo "Contraseña maestra : la que escribiste"
+fi
 echo
 echo "IMPORTANTE: el dominio debe apuntar previamente a este servidor"
 echo "y los puertos 80 y 443 deben estar abiertos en el firewall del proveedor."
+echo
+
+if [ "${ODOO_SOLO_PREGUNTAS:-}" = "1" ]; then
+    echo "Modo ODOO_SOLO_PREGUNTAS: no se instaló nada."
+    exit 0
+fi
+
+if [ "${ODOO_SI:-}" != "1" ]; then
+    RESPUESTA=""
+    printf '¿Instalar con estos datos? (s/N): ' >&2
+    leer_linea RESPUESTA || error "No hay terminal para confirmar. Para instalar sin preguntas usa ODOO_SI=1."
+    case "${RESPUESTA,,}" in
+        s|si|sí) ;;
+        *)
+            echo "Instalación cancelada. No se tocó nada."
+            exit 0
+            ;;
+    esac
+fi
 
 # ============================================================
 # 1. ACTUALIZAR SISTEMA
